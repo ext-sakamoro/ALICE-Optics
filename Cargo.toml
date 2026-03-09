@@ -1,0 +1,10 @@
+[package]
+name = "alice-optics"
+version = "1.0.0"
+edition = "2021"
+authors = ["Moroya Sakamoto"]
+license = "MIT"
+description = "Optical simulation: lens systems, ray tracing, diffraction, polarization, thin film interference, Snell/Fresnel, fiber optics, aberrations"
+
+[lib]
+crate-type = ["rlib"]
