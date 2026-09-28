@@ -24,6 +24,12 @@
 //! assert!((field.at(1, 1).concentration - 1.0).abs() < 1e-9);
 //! ```
 
+// Lattice indices are bounded by the grid the caller allocated, so turning one
+// into a coordinate cannot lose anything an f64 would notice.
+#![allow(clippy::cast_precision_loss)]
+
+use crate::fresnel::fresnel_unpolarized;
+use crate::snell::snell_vec;
 use crate::vec3::Vec3;
 
 /// Refractive index of water used by [`CausticConfig::preset_air_to_water`].
@@ -72,6 +78,14 @@ pub enum CausticError {
     /// The refracted ray at this lattice node did not travel downward, so it
     /// never meets the floor.
     RayMissesFloor {
+        /// Offending lattice index, in `j * nx + i` order.
+        index: usize,
+    },
+    /// The surface at this lattice node turns its back on the light.
+    ///
+    /// Refracting anyway would silently treat the ray as arriving from below the
+    /// interface and return a plausible-looking number for an unlit node.
+    SurfaceFacesAway {
         /// Offending lattice index, in `j * nx + i` order.
         index: usize,
     },
@@ -261,13 +275,13 @@ impl<'a> SurfaceGrid<'a> {
     /// Distance between neighbouring nodes along x.
     #[must_use]
     pub fn spacing_x(self) -> f64 {
-        todo!("SurfaceGrid::spacing_x not implemented")
+        self.extent_x / (self.nx - 1) as f64
     }
 
     /// Distance between neighbouring nodes along z.
     #[must_use]
     pub fn spacing_z(self) -> f64 {
-        todo!("SurfaceGrid::spacing_z not implemented")
+        self.extent_z / (self.nz - 1) as f64
     }
 
     /// World position of lattice node `(i, j)`.
@@ -275,8 +289,11 @@ impl<'a> SurfaceGrid<'a> {
     /// # Panics
     /// If `i >= nx` or `j >= nz`.
     #[must_use]
-    pub fn position(self, _i: usize, _j: usize) -> Vec3 {
-        todo!("SurfaceGrid::position not implemented")
+    pub fn position(self, i: usize, j: usize) -> Vec3 {
+        assert!(i < self.nx && j < self.nz, "lattice index out of range");
+        let x = (i as f64).mul_add(self.spacing_x(), -self.extent_x / 2.0);
+        let z = (j as f64).mul_add(self.spacing_z(), -self.extent_z / 2.0);
+        Vec3::new(x, self.heights[j * self.nx + i], z)
     }
 
     /// Upward surface normal at lattice node `(i, j)`.
@@ -284,8 +301,9 @@ impl<'a> SurfaceGrid<'a> {
     /// # Panics
     /// If `i >= nx` or `j >= nz`.
     #[must_use]
-    pub fn normal(self, _i: usize, _j: usize) -> Vec3 {
-        todo!("SurfaceGrid::normal not implemented")
+    pub fn normal(self, i: usize, j: usize) -> Vec3 {
+        assert!(i < self.nx && j < self.nz, "lattice index out of range");
+        self.normals[j * self.nx + i]
     }
 }
 
@@ -349,6 +367,59 @@ impl CausticField {
     }
 }
 
+/// Where one node's ray lands and what fraction of the source it still carries.
+struct NodeTrace {
+    landing: Vec3,
+    /// Everything except the obliquity factor, which is shared by the whole field.
+    carried: f64,
+}
+
+/// Send one ray through the interface and down to the floor.
+fn trace_node(
+    position: Vec3,
+    normal: Vec3,
+    dir: Vec3,
+    cfg: &CausticConfig,
+    index: usize,
+) -> Result<NodeTrace, CausticError> {
+    if position.y <= cfg.floor_y {
+        return Err(CausticError::FloorAboveSurface { index });
+    }
+    let n = normal.normalized();
+    let cos_i = -dir.dot(n);
+    if cos_i <= 0.0 {
+        return Err(CausticError::SurfaceFacesAway { index });
+    }
+    let refracted = snell_vec(dir, n, cfg.ior_above, cfg.ior_below)
+        .ok_or(CausticError::TotalInternalReflection { index })?;
+    if refracted.y >= 0.0 {
+        return Err(CausticError::RayMissesFloor { index });
+    }
+
+    let path = (position.y - cfg.floor_y) / -refracted.y;
+    let landing = position.plus(refracted.scale(path));
+    // `cos_i` can overshoot 1 by a rounding step; `acos` would give NaN there.
+    let theta_i = cos_i.min(1.0).acos();
+    let transmittance = 1.0 - fresnel_unpolarized(cfg.ior_above, theta_i, cfg.ior_below);
+    let carried = cfg.source_irradiance * transmittance * (-cfg.absorption * path).exp();
+
+    Ok(NodeTrace { landing, carried })
+}
+
+/// The two nodes a derivative along one axis is taken between, and their distance.
+///
+/// Central inside, one-sided at the two borders, which is why a caller comparing
+/// against a geometric area should stay off the border ring.
+const fn stencil(index: usize, count: usize, step: f64) -> (usize, usize, f64) {
+    if index == 0 {
+        (0, 1, step)
+    } else if index == count - 1 {
+        (count - 2, count - 1, step)
+    } else {
+        (index - 1, index + 1, 2.0 * step)
+    }
+}
+
 /// Refract the light at every lattice node and measure where it concentrates.
 ///
 /// `light_dir` is the direction the light *travels*, so it points downward.
@@ -356,9 +427,66 @@ impl CausticField {
 /// # Errors
 /// Any variant of [`CausticError`]; see its documentation.
 pub fn trace_caustics(
-    _grid: &SurfaceGrid<'_>,
-    _light_dir: Vec3,
-    _cfg: &CausticConfig,
+    grid: &SurfaceGrid<'_>,
+    light_dir: Vec3,
+    cfg: &CausticConfig,
 ) -> Result<CausticField, CausticError> {
-    todo!("trace_caustics not implemented")
+    if !light_dir.x.is_finite() || !light_dir.y.is_finite() || !light_dir.z.is_finite() {
+        return Err(CausticError::LightDirectionInvalid);
+    }
+    let dir = light_dir.normalized();
+    // A degenerate direction normalizes to zero, whose y is not below zero either.
+    if dir.y >= 0.0 {
+        return Err(CausticError::LightDirectionInvalid);
+    }
+
+    let nx = grid.nx();
+    let nz = grid.nz();
+    // Flux through a horizontal footprint, so the tilt of the beam counts and the
+    // tilt of the surface does not; the surface tilt is already in the Fresnel term.
+    let obliquity = -dir.y;
+
+    let mut landings = Vec::with_capacity(nx * nz);
+    let mut carried = Vec::with_capacity(nx * nz);
+    for j in 0..nz {
+        for i in 0..nx {
+            let index = j * nx + i;
+            let node = trace_node(grid.position(i, j), grid.normal(i, j), dir, cfg, index)?;
+            landings.push(node.landing);
+            carried.push(obliquity * node.carried);
+        }
+    }
+
+    let dx = grid.spacing_x();
+    let dz = grid.spacing_z();
+    let mut samples = Vec::with_capacity(nx * nz);
+    for j in 0..nz {
+        for i in 0..nx {
+            let (lo_i, hi_i, span_x) = stencil(i, nx, dx);
+            let (lo_j, hi_j, span_z) = stencil(j, nz, dz);
+            let d_dx = landings[j * nx + hi_i]
+                .minus(landings[j * nx + lo_i])
+                .scale(1.0 / span_x);
+            let d_dz = landings[hi_j * nx + i]
+                .minus(landings[lo_j * nx + i])
+                .scale(1.0 / span_z);
+            // Jacobian determinant of the landing map, taken in the xz plane.
+            let det = d_dx.x.mul_add(d_dz.z, -(d_dx.z * d_dz.x));
+            // A vanishing determinant is a focus; dividing gives infinity, which is
+            // the honest answer, so it is not special-cased into a finite stand-in.
+            let concentration = 1.0 / det.abs();
+            samples.push(CausticSample {
+                landing: landings[j * nx + i],
+                transmitted: carried[j * nx + i],
+                concentration,
+            });
+        }
+    }
+
+    Ok(CausticField {
+        nx,
+        nz,
+        cell_area: dx * dz,
+        samples,
+    })
 }

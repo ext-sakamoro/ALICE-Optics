@@ -15,6 +15,7 @@ Optical simulation library for the ALICE ecosystem. Covers geometric optics, wav
 - **Aberrations** -- Spherical, chromatic, coma, Petzval curvature, distortion, Abbe number, achromatic doublet
 - **Gaussian Beams** -- Rayleigh range, beam waist, divergence, Gouy phase
 - **Prisms & Interferometry** -- Minimum deviation, angular dispersion, OPD, coherence length, fringe visibility
+- **Caustics** -- Light refracted through a height-field surface and concentrated on a floor, as the reciprocal Jacobian determinant of the landing map; obliquity, Fresnel transmittance and Beer-Lambert attenuation included
 
 ## Architecture
 
@@ -29,7 +30,13 @@ StokesVector         Polarization (Mueller calculus)
 Diffraction          Wave optics (slits, gratings, Airy)
     |
 Fiber / Aberration   Applied optics modules
+Caustics             Surface -> floor irradiance (Snell + Fresnel + Beer-Lambert)
 ```
+
+Every expectation in `tests/analytic_caustics.rs` is a closed form written out by
+hand -- an affine surface cannot concentrate light, normal-incidence transmittance
+into water is exactly 48/49, a parabolic dip of radius R focuses at R / (1 - n1/n2)
+-- never a value the tracer produced.
 
 ## License
 

@@ -113,17 +113,36 @@ fn flat_surface_under_oblique_light_has_unit_concentration_everywhere() {
 }
 
 #[test]
-fn uniformly_tilted_surface_has_unit_concentration_everywhere() {
-    // Oracle: a constant slope means a constant normal, so again one refracted
-    // direction for the whole surface and again a translation.
-    let (heights, normals) = tilted_surface(9, 4.0, 0.2);
+fn uniformly_tilted_surface_stretches_by_the_deviation_closed_form() {
+    // Oracle: a constant slope gives one refracted direction for the whole
+    // surface, but *not* a translation. The interface itself is tilted, so the
+    // depth below it grows across x and the rays travel further as they go, which
+    // stretches the landing map along x by a constant factor.
+    //
+    // Exactly, for a plane tilted by `alpha` under vertical light:
+    //   theta2 = asin(sin(alpha) / n)            refraction angle
+    //   the ray leaves deviated from vertical by alpha - theta2, in the xz plane
+    //   dF_x/dx = 1 + tan(alpha) * tan(alpha - theta2)
+    // and the other three entries of the Jacobian are 1, 0 and 0.
+    //
+    // This is not the paraxial limit: every term above is exact for a plane.
+    let slope = 0.2_f64;
+    let (heights, normals) = tilted_surface(9, 4.0, slope);
     let grid = SurfaceGrid::new(9, 9, 4.0, 4.0, &heights, &normals).unwrap();
     let cfg = CausticConfig::preset_air_to_water(-6.0).unwrap();
 
     let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
 
+    let alpha = slope.atan();
+    let theta2 = (alpha.sin() / (IOR_WATER / IOR_AIR)).asin();
+    let expected = 1.0 / slope.mul_add((alpha - theta2).tan(), 1.0);
+    assert!(
+        (expected - 1.0).abs() > 1e-3,
+        "the case must not collapse into the flat-surface one: {expected}"
+    );
+
     for (index, s) in field.samples.iter().enumerate() {
-        assert_rel(s.concentration, 1.0, 1e-9, &format!("node {index}"));
+        assert_rel(s.concentration, expected, 1e-12, &format!("node {index}"));
     }
 }
 

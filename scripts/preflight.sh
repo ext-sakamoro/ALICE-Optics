@@ -25,11 +25,21 @@ need actionlint "brew install actionlint"
 step "ci.yml / fmt: Check formatting"
 ( export CARGO_TERM_COLOR="always"; cargo fmt -- --check )
 
+step "ci.yml / clippy: Lint"
+relint
+( export CARGO_TERM_COLOR="always"; cargo clippy --all-targets --all-features -- -D warnings )
+
 step "ci.yml / actionlint: actionlint"
 actionlint .github/workflows/*.yml
 
 if [[ $quick -eq 1 ]]; then
-  echo; echo "preflight --quick OK (test / bench suites skipped)"; exit 0
+  echo; echo "preflight --quick OK (test suites skipped)"; exit 0
 fi
+
+step "ci.yml / test: Run tests"
+( export CARGO_TERM_COLOR="always"; cargo test --all-targets --all-features )
+
+step "ci.yml / test: Run doc tests"
+( export CARGO_TERM_COLOR="always"; cargo test --doc --all-features )
 
 echo; echo "preflight OK"

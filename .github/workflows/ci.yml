@@ -21,6 +21,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test --all-targets --all-features
+      - name: Run doc tests
+        run: cargo test --doc --all-features
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   actionlint:
     name: actionlint (workflow YAML 検証)
     runs-on: ubuntu-latest
