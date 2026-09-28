@@ -9,6 +9,7 @@
 //! thin film interference, Snell/Fresnel equations, fiber optics, and aberrations.
 
 pub mod aberrations;
+pub mod caustics;
 pub mod diffraction;
 pub mod dispersion;
 pub mod fiber;
