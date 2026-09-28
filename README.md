@@ -15,7 +15,7 @@ Optical simulation library for the ALICE ecosystem. Covers geometric optics, wav
 - **Aberrations** -- Spherical, chromatic, coma, Petzval curvature, distortion, Abbe number, achromatic doublet
 - **Gaussian Beams** -- Rayleigh range, beam waist, divergence, Gouy phase
 - **Prisms & Interferometry** -- Minimum deviation, angular dispersion, OPD, coherence length, fringe visibility
-- **Caustics** -- Light refracted through a height-field surface and concentrated on a floor, as the reciprocal Jacobian determinant of the landing map; obliquity, Fresnel transmittance and Beer-Lambert attenuation included
+- **Caustics** -- Light refracted through a height-field surface and concentrated on a floor, as the reciprocal Jacobian determinant of the landing map; obliquity, Fresnel transmittance and Beer-Lambert attenuation included, plus bilinear deposition of the field onto a floor grid with the spilled power reported
 
 ## Architecture
 

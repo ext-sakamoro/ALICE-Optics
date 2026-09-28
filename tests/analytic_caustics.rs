@@ -6,7 +6,7 @@
 //! downstream user does.
 
 use alice_optics::caustics::{
-    trace_caustics, CausticConfig, CausticError, SurfaceGrid, IOR_AIR, IOR_WATER,
+    accumulate, trace_caustics, CausticConfig, CausticError, SurfaceGrid, IOR_AIR, IOR_WATER,
 };
 use alice_optics::fresnel::fresnel_unpolarized;
 use alice_optics::vec3::Vec3;
@@ -487,4 +487,190 @@ fn a_floor_above_the_surface_is_rejected() {
         trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap_err(),
         CausticError::FloorAboveSurface { .. }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Oracle 6: depositing the field onto the floor conserves what it carried.
+// ---------------------------------------------------------------------------
+
+/// Sum of the power leaving the surface, over the whole lattice.
+fn leaving_power(field: &alice_optics::caustics::CausticField) -> f64 {
+    field
+        .samples
+        .iter()
+        .map(|s| s.transmitted * field.cell_area)
+        .sum()
+}
+
+#[test]
+fn depositing_the_field_conserves_power() {
+    // Oracle: a bin is a place to put light, not a place to lose it. Everything
+    // that leaves the surface either lands inside the image or is reported as
+    // spilled, and the two must add back up to what left.
+    let (heights, normals) = parabolic_dip(41, 4.0, 200.0);
+    let grid = SurfaceGrid::new(41, 41, 4.0, 4.0, &heights, &normals).unwrap();
+    let cfg = CausticConfig::preset_air_to_water(-300.0).unwrap();
+    let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
+
+    let image = accumulate(&field, 64, 64, 4.0, 4.0).unwrap();
+    let landed: f64 = image.cells.iter().map(|c| c * image.bin_area).sum();
+
+    assert_rel(
+        landed + image.spilled_power,
+        leaving_power(&field),
+        1e-12,
+        "power deposited plus power spilled",
+    );
+}
+
+#[test]
+fn a_flat_surface_deposits_a_uniform_image() {
+    // Oracle: a flat interface translates the beam without bending it, so every
+    // bin that is covered receives the same irradiance -- and by conservation
+    // that irradiance is the transmitted one, because the concentration is 1.
+    let (heights, normals) = flat_surface(65);
+    let grid = SurfaceGrid::new(65, 65, 8.0, 8.0, &heights, &normals).unwrap();
+    let cfg = CausticConfig::preset_air_to_water(-2.0).unwrap();
+    let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
+
+    // Image smaller than the lattice, so every bin is fully covered.
+    let image = accumulate(&field, 8, 8, 4.0, 4.0).unwrap();
+    let expected = 48.0 / 49.0;
+    for (index, cell) in image.cells.iter().enumerate() {
+        assert_rel(*cell, expected, 1e-9, &format!("bin {index}"));
+    }
+}
+
+#[test]
+fn a_focusing_surface_puts_more_light_in_the_middle_than_a_flat_one() {
+    // Oracle: the Jacobian already says the centre is brighter by a known
+    // factor; depositing the samples has to agree with it. Both routes are in
+    // this crate but they share no code: one is a derivative of the landing map,
+    // the other is a histogram of where the rays actually went.
+    let radius = 200.0;
+    let depth = 300.0;
+    let extent = 4.0;
+    let n = 401;
+    let k = deflection_factor(IOR_AIR, IOR_WATER);
+    let expected = (48.0 / 49.0) * paraxial_concentration(radius, depth, k);
+
+    let (heights, normals) = parabolic_dip(n, extent, radius);
+    let grid = SurfaceGrid::new(n, n, extent, extent, &heights, &normals).unwrap();
+    let cfg = CausticConfig::preset_air_to_water(-depth).unwrap();
+    let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
+
+    // The lattice spans 4.0 but the light converges into 4.0 * (1 - k d / R);
+    // image only the middle, where every bin is covered by landed rays.
+    let image = accumulate(&field, 9, 9, 1.0, 1.0).unwrap();
+    let centre = image.cells[4 * 9 + 4];
+    assert_rel(
+        centre,
+        expected,
+        2e-2,
+        "irradiance at the centre of the image",
+    );
+}
+
+#[test]
+fn an_image_smaller_than_two_bins_is_rejected() {
+    let (heights, normals) = flat_surface(5);
+    let grid = SurfaceGrid::new(5, 5, 2.0, 2.0, &heights, &normals).unwrap();
+    let cfg = CausticConfig::preset_air_to_water(-1.0).unwrap();
+    let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
+    assert_eq!(
+        accumulate(&field, 1, 8, 1.0, 1.0).unwrap_err(),
+        CausticError::GridTooSmall
+    );
+    assert_eq!(
+        accumulate(&field, 8, 8, 0.0, 1.0).unwrap_err(),
+        CausticError::GridExtentInvalid
+    );
+}
+
+/// A trough that dips along x only: `h = -x^2 / (2R)`, with its exact normal.
+///
+/// Deliberately not symmetric in x and z, so that anything which confuses the
+/// two axes shows up.
+fn parabolic_trough(n: usize, extent: f64, radius: f64) -> (Vec<f64>, Vec<Vec3>) {
+    let mut heights = Vec::with_capacity(n * n);
+    let mut normals = Vec::with_capacity(n * n);
+    for j in 0..n {
+        for i in 0..n {
+            let (x, _z) = node_xz(i, j, n, extent);
+            heights.push(-(x * x) / (2.0 * radius));
+            normals.push(Vec3::new(x / radius, 1.0, 0.0).normalized());
+        }
+    }
+    (heights, normals)
+}
+
+#[test]
+fn light_that_misses_the_image_is_reported_as_spilled() {
+    // Oracle: conservation again, but on a case where spilling actually happens.
+    // A flat surface spreads its light over the whole lattice footprint, so an
+    // image covering a sixteenth of that area can only catch a sixteenth of the
+    // power -- the rest has to be accounted for, not dropped.
+    let (heights, normals) = flat_surface(129);
+    let grid = SurfaceGrid::new(129, 129, 4.0, 4.0, &heights, &normals).unwrap();
+    let cfg = CausticConfig::preset_air_to_water(-2.0).unwrap();
+    let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
+
+    let image = accumulate(&field, 8, 8, 1.0, 1.0).unwrap();
+    let landed: f64 = image.cells.iter().map(|c| c * image.bin_area).sum();
+    let leaving = leaving_power(&field);
+
+    assert!(
+        image.spilled_power > 0.5 * leaving,
+        "most of the light must miss a 1x1 image of a 4x4 footprint: spilled {:.4}, leaving {leaving:.4}",
+        image.spilled_power
+    );
+    assert_rel(
+        landed + image.spilled_power,
+        leaving,
+        1e-12,
+        "power deposited plus power spilled",
+    );
+}
+
+#[test]
+fn a_trough_brightens_along_one_axis_only() {
+    // Oracle: a surface that bends light in x and not in z must produce an image
+    // that varies in x and not in z. This is what tells the two axes apart: an
+    // implementation that transposes its indexing reproduces every symmetric
+    // case exactly and fails only here.
+    let radius = 200.0;
+    let depth = 300.0;
+    let n = 401;
+    let (heights, normals) = parabolic_trough(n, 4.0, radius);
+    let grid = SurfaceGrid::new(n, n, 4.0, 4.0, &heights, &normals).unwrap();
+    let cfg = CausticConfig::preset_air_to_water(-depth).unwrap();
+    let field = trace_caustics(&grid, Vec3::new(0.0, -1.0, 0.0), &cfg).unwrap();
+
+    // Deliberately not square, so a swapped index cannot even land in range.
+    let image = accumulate(&field, 7, 5, 1.0, 1.0).unwrap();
+
+    // Along z the image must be flat: every row of the image is the same.
+    for i in 0..7 {
+        let first = image.cells[i];
+        for j in 1..5 {
+            assert_rel(
+                image.cells[j * 7 + i],
+                first,
+                1e-9,
+                &format!("column {i} must not vary along z (row {j})"),
+            );
+        }
+    }
+
+    // Along x it must brighten toward the middle by the one-dimensional factor:
+    // only x is compressed, by 1 - k d / R, so the concentration is its
+    // reciprocal, not its square.
+    let k = deflection_factor(IOR_AIR, IOR_WATER);
+    let expected = (48.0 / 49.0) / k.mul_add(-depth / radius, 1.0);
+    assert_rel(
+        image.cells[3],
+        expected,
+        2e-2,
+        "middle column of the trough",
+    );
 }

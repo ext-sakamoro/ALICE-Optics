@@ -27,6 +27,10 @@
 // Lattice indices are bounded by the grid the caller allocated, so turning one
 // into a coordinate cannot lose anything an f64 would notice.
 #![allow(clippy::cast_precision_loss)]
+// Bin indices are taken from a coordinate that has already been checked to be
+// inside the image, so the truncation is the floor that is wanted and the value
+// cannot be negative.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use crate::fresnel::fresnel_unpolarized;
 use crate::snell::snell_vec;
@@ -488,5 +492,102 @@ pub fn trace_caustics(
         nz,
         cell_area: dx * dz,
         samples,
+    })
+}
+
+/// A caustic field deposited onto a regular grid of the floor.
+///
+/// Produced by [`accumulate`] and read by the caller.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct CausticImage {
+    /// Bins along x.
+    pub nx: usize,
+    /// Bins along z.
+    pub nz: usize,
+    /// Area of one bin.
+    pub bin_area: f64,
+    /// Irradiance per bin, in `j * nx + i` order.
+    pub cells: Vec<f64>,
+    /// Power that landed outside the image and was dropped.
+    ///
+    /// Not an error: a surface near the edge of the lattice genuinely sends
+    /// light past the region being imaged. It is reported rather than silently
+    /// discarded so that a caller checking the energy balance can account for it.
+    pub spilled_power: f64,
+}
+
+/// Deposit every sample's power into the bin its ray landed in.
+///
+/// This is the step a GPU does by drawing the deformed lattice with additive
+/// blending; here it is a loop in a fixed order, so the sum is reproducible.
+/// The image is centred on the origin and spans `extent_x` by `extent_z`.
+///
+/// # Errors
+/// [`CausticError::GridTooSmall`] below 2x2 bins, or
+/// [`CausticError::GridExtentInvalid`] if an extent is not finite and positive.
+pub fn accumulate(
+    field: &CausticField,
+    nx: usize,
+    nz: usize,
+    extent_x: f64,
+    extent_z: f64,
+) -> Result<CausticImage, CausticError> {
+    if nx < 2 || nz < 2 {
+        return Err(CausticError::GridTooSmall);
+    }
+    if !extent_x.is_finite() || !extent_z.is_finite() || extent_x <= 0.0 || extent_z <= 0.0 {
+        return Err(CausticError::GridExtentInvalid);
+    }
+
+    let bin_x = extent_x / nx as f64;
+    let bin_z = extent_z / nz as f64;
+    let bin_area = bin_x * bin_z;
+    let mut cells = vec![0.0; nx * nz];
+    let mut spilled_power = 0.0;
+
+    for sample in &field.samples {
+        // Power, not irradiance: a sample speaks for one lattice cell, and that
+        // is the quantity a bin can add up without knowing where it came from.
+        let power = sample.transmitted * field.cell_area;
+        // Bilinear splat, not a nearest-bin histogram. A GPU draws the deformed
+        // lattice as filled quads, so a sample stands for an area, not a point;
+        // dropping it into one bin quantises the answer by however many landing
+        // points happen to fall inside a bin, which is a fraction, not a whole
+        // number. Spreading it over the four bins it sits between removes that
+        // and conserves the power exactly, because the weights sum to one.
+        let u = 0.5f64.mul_add(extent_x, sample.landing.x) / bin_x - 0.5;
+        let v = 0.5f64.mul_add(extent_z, sample.landing.z) / bin_z - 0.5;
+        let (i0, j0) = (u.floor(), v.floor());
+        let (fu, fv) = (u - i0, v - j0);
+
+        for (di, wu) in [(0.0, 1.0 - fu), (1.0, fu)] {
+            for (dj, wv) in [(0.0, 1.0 - fv), (1.0, fv)] {
+                let share = power * wu * wv;
+                let (bi, bj) = (i0 + di, j0 + dj);
+                if bi < 0.0 || bj < 0.0 {
+                    spilled_power += share;
+                    continue;
+                }
+                let (i, j) = (bi as usize, bj as usize);
+                if i >= nx || j >= nz {
+                    spilled_power += share;
+                    continue;
+                }
+                cells[j * nx + i] += share;
+            }
+        }
+    }
+
+    for cell in &mut cells {
+        *cell /= bin_area;
+    }
+
+    Ok(CausticImage {
+        nx,
+        nz,
+        bin_area,
+        cells,
+        spilled_power,
     })
 }
