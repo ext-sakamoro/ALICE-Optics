@@ -40,4 +40,6 @@ into water is exactly 48/49, a parabolic dip of radius R focuses at R / (1 - n1/
 
 ## License
 
-MIT OR Apache-2.0
+`LicenseRef-Proprietary`. The text is [LICENSE-Proprietary](LICENSE-Proprietary).
+
+Enquiries: https://extoria.co.jp/
